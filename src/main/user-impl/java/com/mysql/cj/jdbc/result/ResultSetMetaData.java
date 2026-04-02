@@ -86,6 +86,23 @@ public class ResultSetMetaData implements java.sql.ResultSetMetaData {
             return "";
         }
         String database = getField(column).getDatabaseName();
+        // [DDB Compatibility] DDB's column definition packet sends an empty database name
+        // in the column definition protocol packet. DBeaver uses getCatalogName() to build
+        // the key identity string for row editing. If it gets "", it falls back to its own
+        // internal catalog display name (which may use hyphens instead of underscores),
+        // causing a catalog mismatch and "attributes of key ... are missing in result set" errors.
+        //
+        // Fix: when the protocol-level databaseName is empty/null, fall back to the logical
+        // database name recorded in hostInfo (from the JDBC URL), if it is available.
+        // This is safe for standard MySQL too: if MySQL also returns "" for databaseName
+        // (which it can for views or computed columns), using the connection's current database
+        // is the correct fallback behavior.
+        if (database == null || database.isEmpty()) {
+            String logicalDb = this.session.getHostInfo().getDatabase();
+            if (logicalDb != null && !logicalDb.isEmpty()) {
+                return logicalDb;
+            }
+        }
         return database == null ? "" : database;
     }
 

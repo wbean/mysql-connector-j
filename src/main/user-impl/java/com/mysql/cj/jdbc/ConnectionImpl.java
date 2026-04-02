@@ -2169,60 +2169,8 @@ public class ConnectionImpl implements JdbcConnection, SessionEventListener, Ser
                 throw SQLError.createSQLException("Database can not be null", MysqlErrorNumbers.SQL_STATE_ILLEGAL_ARGUMENT, getExceptionInterceptor());
             }
 
-            if (this.connectionLifecycleInterceptors != null) {
-                IterateBlock<ConnectionLifecycleInterceptor> iter = new IterateBlock<ConnectionLifecycleInterceptor>(
-                        this.connectionLifecycleInterceptors.iterator()) {
-
-                    @Override
-                    void forEach(ConnectionLifecycleInterceptor each) throws SQLException {
-                        if (!each.setDatabase(db)) {
-                            this.stopIterating = true;
-                        }
-                    }
-
-                };
-
-                iter.doForAll();
-
-                if (!iter.fullIteration()) {
-                    return;
-                }
-            }
-
-            if (this.useLocalSessionState.getValue()) {
-                if (this.session.getServerSession().isLowerCaseTableNames()) {
-                    if (this.database.equalsIgnoreCase(db)) {
-                        return;
-                    }
-                } else if (this.database.equals(db)) {
-                    return;
-                }
-            }
-
-            TelemetrySpan span = this.session.getTelemetryHandler().startSpan(TelemetrySpanName.USE_DATABASE);
-            try (TelemetryScope scope = span.makeCurrent()) {
-                span.setAttribute(TelemetryAttribute.DB_NAME, db);
-                span.setAttribute(TelemetryAttribute.DB_OPERATION, TelemetryAttribute.OPERATION_USE);
-                span.setAttribute(TelemetryAttribute.DB_STATEMENT, TelemetryAttribute.OPERATION_USE + TelemetryAttribute.STATEMENT_SUFFIX);
-                span.setAttribute(TelemetryAttribute.DB_SYSTEM, TelemetryAttribute.DB_SYSTEM_DEFAULT);
-                span.setAttribute(TelemetryAttribute.DB_USER, getUser());
-                span.setAttribute(TelemetryAttribute.THREAD_ID, Thread.currentThread().getId());
-                span.setAttribute(TelemetryAttribute.THREAD_NAME, Thread.currentThread().getName());
-
-                String quotedId = this.session.getIdentifierQuoteString();
-
-                StringBuilder query = new StringBuilder("USE ");
-                query.append(StringUtils.quoteIdentifier(db, quotedId, this.pedantic.getValue()));
-
-                this.session.execSQL(null, query.toString(), -1, null, false, this.nullStatementResultSetFactory, null, false);
-
-                this.database = db;
-            } catch (Throwable t) {
-                span.setError(t);
-                throw t;
-            } finally {
-                span.end();
-            }
+            // [DDB] DDB does not support USE <db> command. Only update the local field.
+            this.database = db;
         }
     }
 
@@ -2297,6 +2245,11 @@ public class ConnectionImpl implements JdbcConnection, SessionEventListener, Ser
         synchronized (getConnectionMutex()) {
             checkClosed();
 
+            // [DDB] SAVEPOINT is not supported by DDB.
+            throw SQLError.createSQLFeatureNotSupportedException(
+                    "DDB does not support SAVEPOINT. Nested transactions (e.g. Spring PROPAGATION_NESTED) are not available.",
+                    MysqlErrorNumbers.SQL_STATE_DRIVER_NOT_CAPABLE, getExceptionInterceptor());
+            /* dead code - DDB does not support SAVEPOINT
             StringBuilder savePointQuery = new StringBuilder("SAVEPOINT ");
             savePointQuery.append(StringUtils.quoteIdentifier(savepoint.getSavepointName(), this.session.getIdentifierQuoteString(), this.pedantic.getValue()));
             java.sql.Statement stmt = null;
@@ -2306,6 +2259,7 @@ public class ConnectionImpl implements JdbcConnection, SessionEventListener, Ser
             } finally {
                 closeStatement(stmt);
             }
+            */
         }
     }
 

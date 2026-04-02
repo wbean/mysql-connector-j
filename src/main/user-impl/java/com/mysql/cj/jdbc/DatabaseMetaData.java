@@ -768,12 +768,10 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
     private String metadataEncoding;
     private int metadataCollationIndex;
 
+
     protected static DatabaseMetaData getInstance(JdbcConnection connToSet, String databaseToSet, boolean checkForInfoSchema, ResultSetFactory resultSetFactory)
             throws SQLException {
-        if (checkForInfoSchema && connToSet.getPropertySet().getBooleanProperty(PropertyKey.useInformationSchema).getValue()) {
-            return new DatabaseMetaDataUsingInfoSchema(connToSet, databaseToSet, resultSetFactory);
-        }
-
+        // [DDB] Always use SHOW-command-based implementation; DDB has no INFORMATION_SCHEMA.
         return new DatabaseMetaData(connToSet, databaseToSet, resultSetFactory);
     }
 
@@ -1197,8 +1195,10 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
             for (int i = 0; i < numTables; i++) {
                 String tableToExtract = tableList.get(i);
 
+                // [DDB] DDB does not support SHOW CREATE TABLE `db`.`table` (dot notation).
+                // Use only the table name without schema prefix.
                 String query = new StringBuilder("SHOW CREATE TABLE ")
-                        .append(StringUtils.getFullyQualifiedName(dbName, tableToExtract, this.quotedId, this.pedantic)).toString();
+                        .append(StringUtils.quoteIdentifier(tableToExtract, this.quotedId, this.pedantic)).toString();
 
                 try {
                     rs = stmt.executeQuery(query);
@@ -1419,7 +1419,8 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
         try {
             paramRetrievalStmt = this.conn.getMetadataSafeStatement();
             String oldDb = this.conn.getDatabase();
-            if (this.conn.lowerCaseTableNames() && db != null && db.length() != 0 && oldDb != null && oldDb.length() != 0) {
+            // [DDB] DDB does not support stored procedures, USE or SELECT DATABASE(). Skip entirely.
+            if (false && this.conn.lowerCaseTableNames() && db != null && db.length() != 0 && oldDb != null && oldDb.length() != 0) {
                 // Workaround for bug in server wrt. to  SHOW CREATE PROCEDURE not respecting lower-case table names
 
                 ResultSet rs = null;
@@ -1841,16 +1842,18 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
 
     protected IteratorWithCleanup<String> getDatabaseIterator(String dbSpec) throws SQLException {
         if (dbSpec == null) {
-            return this.nullDatabaseMeansCurrent.getValue() ? new SingleStringIterator(this.database) : new StringListIterator(getDatabases());
+            // [DDB] SHOW DATABASES returns physical shard names. Always use the logical db name.
+            return new SingleStringIterator(this.database);
         }
         return new SingleStringIterator(this.pedantic ? dbSpec : StringUtils.unQuoteIdentifier(dbSpec, this.quotedId));
     }
 
     protected IteratorWithCleanup<String> getSchemaPatternIterator(String schemaPattern) throws SQLException {
         if (schemaPattern == null) {
-            return this.nullDatabaseMeansCurrent.getValue() ? new SingleStringIterator(this.database) : new StringListIterator(getDatabases());
+            // [DDB] SHOW DATABASES returns physical shard names. Always use the logical db name.
+            return new SingleStringIterator(this.database);
         }
-        return new StringListIterator(getDatabases(schemaPattern)); //new SingleStringIterator(this.pedantic ? schemaPattern : StringUtils.unQuoteIdentifier(schemaPattern, this.quotedId));
+        return new StringListIterator(getDatabases(schemaPattern));
     }
 
     /**
@@ -1966,9 +1969,27 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
 
     protected String getDatabase(String catalog, String schema) {
         if (this.databaseTerm.getValue() == DatabaseTerm.SCHEMA) {
-            return schema == null && this.nullDatabaseMeansCurrent.getValue() ? this.database : schema;
+            if (schema == null && this.nullDatabaseMeansCurrent.getValue()) {
+                return this.database;
+            }
+            // DDB: DBeaver may pass the display name with hyphens instead of underscores.
+            // If the schema differs only in hyphen vs underscore, map it back to this.database.
+            if (schema != null && this.database != null
+                    && schema.replace('-', '_').equalsIgnoreCase(this.database)) {
+                return this.database;
+            }
+            return schema;
         }
-        return catalog == null && this.nullDatabaseMeansCurrent.getValue() ? this.database : catalog;
+        if (catalog == null && this.nullDatabaseMeansCurrent.getValue()) {
+            return this.database;
+        }
+        // DDB: DBeaver may pass the display name with hyphens instead of underscores.
+        // If the catalog differs only in hyphen vs underscore, map it back to this.database.
+        if (catalog != null && this.database != null
+                && catalog.replace('-', '_').equalsIgnoreCase(this.database)) {
+            return this.database;
+        }
+        return catalog;
     }
 
     protected Field[] getColumnPrivilegesFields() {
@@ -2129,138 +2150,232 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
                         ResultSet results = null;
 
                         try {
-                            StringBuilder queryBuf = new StringBuilder("SHOW FULL COLUMNS FROM ");
-                            queryBuf.append(StringUtils.quoteIdentifier(tableName, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-                            queryBuf.append(" FROM ");
-                            queryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-                            if (colPattern != null) {
-                                queryBuf.append(" LIKE ");
-                                queryBuf.append(StringUtils.quoteIdentifier(colPattern, "'", true));
-                            }
+                            {
+                                // [DDB] Use SHOW CREATE TABLE to get column info for all logical tables.
+                                List<Map<String, String>> ddbCols = parseDdbColumnsFromCreateTable(stmt, tableName);
 
-                            // Return correct ordinals if column name pattern is not '%'
-                            // Currently, MySQL doesn't show enough data to do this, so we do it the 'hard' way...Once _SYSTEM tables are in, this should be
-                            // much easier
-                            boolean fixUpOrdinalsRequired = false;
-                            Map<String, Integer> ordinalFixUpMap = null;
+                                // Build column name pattern matcher for client-side filtering
+                                java.util.regex.Pattern colRegex = null;
+                                if (colPattern != null && !colPattern.equals("%")) {
+                                    String colRegexStr = colPattern
+                                            .replace("\\", "\\\\").replace(".", "\\.").replace("$", "\\$")
+                                            .replace("^", "\\^").replace("(", "\\(").replace(")", "\\)")
+                                            .replace("[", "\\[").replace("]", "\\]").replace("{", "\\{")
+                                            .replace("}", "\\}").replace("+", "\\+").replace("?", "\\?")
+                                            .replace("|", "\\|").replace("*", "\\*")
+                                            .replace("%", ".*").replace("_", ".");
+                                    colRegex = java.util.regex.Pattern.compile(colRegexStr, java.util.regex.Pattern.CASE_INSENSITIVE);
+                                }
 
-                            if (colPattern != null && !colPattern.equals("%")) {
-                                fixUpOrdinalsRequired = true;
+                                // Build ordinal map from full column list (all columns, regardless of filter)
+                                Map<String, Integer> ordinalMap = new HashMap<>();
+                                for (int oi = 0; oi < ddbCols.size(); oi++) {
+                                    ordinalMap.put(ddbCols.get(oi).get("Field"), oi + 1);
+                                }
 
-                                StringBuilder fullColumnQueryBuf = new StringBuilder("SHOW FULL COLUMNS FROM ");
-                                fullColumnQueryBuf
-                                        .append(StringUtils.quoteIdentifier(tableName, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-                                fullColumnQueryBuf.append(" FROM ");
-                                fullColumnQueryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                                for (Map<String, String> ddbCol : ddbCols) {
+                                    String fieldName = ddbCol.get("Field");
 
-                                results = stmt.executeQuery(fullColumnQueryBuf.toString());
+                                    // Apply column name pattern filter on client side
+                                    if (colRegex != null && !colRegex.matcher(fieldName).matches()) {
+                                        continue;
+                                    }
 
-                                ordinalFixUpMap = new HashMap<>();
+                                    String typeInfo = ddbCol.get("Type");
+                                    String nullInfo  = ddbCol.get("Null");  // "YES" or "NO"
+                                    TypeDescriptor typeDesc = new TypeDescriptor(typeInfo, nullInfo);
 
-                                int fullOrdinalPos = 1;
+                                    byte[][] rowVal = new byte[24][];
+                                    rowVal[0] = DatabaseMetaData.this.databaseTerm.getValue() == DatabaseTerm.SCHEMA ? s2b("def") : s2b(dbStr); // TABLE_CAT
+                                    rowVal[1] = DatabaseMetaData.this.databaseTerm.getValue() == DatabaseTerm.SCHEMA ? s2b(dbStr) : null;       // TABLE_SCHEM
+                                    rowVal[2] = s2b(tableName);                                 // TABLE_NAME
+                                    rowVal[3] = s2b(fieldName);                                 // COLUMN_NAME
+                                    rowVal[4] = Short.toString(typeDesc.mysqlType == MysqlType.YEAR && !DatabaseMetaData.this.yearIsDateType
+                                            ? Types.SMALLINT : (short) typeDesc.mysqlType.getJdbcType()).getBytes(); // DATA_TYPE
+                                    rowVal[5] = s2b(typeDesc.mysqlType.getName());              // TYPE_NAME
+
+                                    if (typeDesc.columnSize == null) {                          // COLUMN_SIZE
+                                        rowVal[6] = null;
+                                    } else {
+                                        String collation = ddbCol.get("Collation");
+                                        int mbminlen = 1;
+                                        if (collation != null) {
+                                            if (collation.contains("ucs2") || collation.contains("utf16")) {
+                                                mbminlen = 2;
+                                            } else if (collation.contains("utf32")) {
+                                                mbminlen = 4;
+                                            }
+                                        }
+                                        rowVal[6] = mbminlen == 1 ? s2b(typeDesc.columnSize.toString())
+                                                : s2b(String.valueOf(typeDesc.columnSize / mbminlen));
+                                    }
+                                    rowVal[7]  = s2b(Integer.toString(typeDesc.bufferLength));
+                                    rowVal[8]  = typeDesc.decimalDigits == null ? null : s2b(typeDesc.decimalDigits.toString());
+                                    rowVal[9]  = s2b(Integer.toString(typeDesc.numPrecRadix));
+                                    rowVal[10] = s2b(Integer.toString(typeDesc.nullability));   // NULLABLE
+                                    rowVal[11] = s2b(ddbCol.get("Comment") != null ? ddbCol.get("Comment") : ""); // REMARKS
+                                    String defVal = ddbCol.get("Default");
+                                    rowVal[12] = defVal != null ? s2b(defVal) : null;           // COLUMN_DEF
+                                    rowVal[13] = new byte[]{ (byte) '0' };                      // SQL_DATA_TYPE
+                                    rowVal[14] = new byte[]{ (byte) '0' };                      // SQL_DATETIME_SUB
+
+                                    String typeName = typeDesc.mysqlType.getName();
+                                    if (StringUtils.indexOfIgnoreCase(typeName, "CHAR") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeName, "BLOB") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeName, "TEXT") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeName, "ENUM") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeName, "SET") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeName, "BINARY") != -1) {
+                                        rowVal[15] = rowVal[6];                                 // CHAR_OCTET_LENGTH
+                                    } else {
+                                        rowVal[15] = null;
+                                    }
+
+                                    // ORDINAL_POSITION: use the position from the full (unfiltered) column list
+                                    Integer ordPos = ordinalMap.get(fieldName);
+                                    rowVal[16] = Integer.toString(ordPos != null ? ordPos : 0).getBytes();
+
+                                    rowVal[17] = s2b(typeDesc.isNullable);                      // IS_NULLABLE
+                                    rowVal[18] = null;
+                                    rowVal[19] = null;
+                                    rowVal[20] = null;
+                                    rowVal[21] = null;
+                                    String extraVal = ddbCol.get("IS_AUTOINCREMENT");
+                                    rowVal[22] = s2b(extraVal != null ? extraVal : "NO");       // IS_AUTOINCREMENT
+                                    rowVal[23] = s2b("NO");                                     // IS_GENERATEDCOLUMN
+
+                                    rows.add(new ByteArrayRow(rowVal, getExceptionInterceptor()));
+                                }
+
+                            } /* else removed: DDB only, no standard MySQL path
+                                // Standard MySQL mode: use SHOW FULL COLUMNS FROM (original logic)
+                                StringBuilder queryBuf = new StringBuilder("SHOW FULL COLUMNS FROM ");
+                                queryBuf.append(StringUtils.quoteIdentifier(tableName, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                                queryBuf.append(" FROM ");
+                                queryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                                if (colPattern != null) {
+                                    queryBuf.append(" LIKE ");
+                                    queryBuf.append(StringUtils.quoteIdentifier(colPattern, "'", true));
+                                }
+
+                                // Return correct ordinals if column name pattern is not '%'
+                                boolean fixUpOrdinalsRequired = false;
+                                Map<String, Integer> ordinalFixUpMap = null;
+
+                                if (colPattern != null && !colPattern.equals("%")) {
+                                    fixUpOrdinalsRequired = true;
+
+                                    StringBuilder fullColumnQueryBuf = new StringBuilder("SHOW FULL COLUMNS FROM ");
+                                    fullColumnQueryBuf
+                                            .append(StringUtils.quoteIdentifier(tableName, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                                    fullColumnQueryBuf.append(" FROM ");
+                                    fullColumnQueryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+
+                                    results = stmt.executeQuery(fullColumnQueryBuf.toString());
+
+                                    ordinalFixUpMap = new HashMap<>();
+
+                                    int fullOrdinalPos = 1;
+
+                                    while (results.next()) {
+                                        String fullOrdColName = results.getString("Field");
+                                        ordinalFixUpMap.put(fullOrdColName, Integer.valueOf(fullOrdinalPos++));
+                                    }
+                                    results.close();
+                                }
+
+                                results = stmt.executeQuery(queryBuf.toString());
+
+                                int ordPos = 1;
 
                                 while (results.next()) {
-                                    String fullOrdColName = results.getString("Field");
+                                    TypeDescriptor typeDesc = new TypeDescriptor(results.getString("Type"), results.getString("Null"));
 
-                                    ordinalFixUpMap.put(fullOrdColName, Integer.valueOf(fullOrdinalPos++));
-                                }
-                                results.close();
-                            }
+                                    byte[][] rowVal = new byte[24][];
+                                    rowVal[0] = DatabaseMetaData.this.databaseTerm.getValue() == DatabaseTerm.SCHEMA ? s2b("def") : s2b(dbStr);    // TABLE_CAT
+                                    rowVal[1] = DatabaseMetaData.this.databaseTerm.getValue() == DatabaseTerm.SCHEMA ? s2b(dbStr) : null;          // TABLE_SCHEM
+                                    rowVal[2] = s2b(tableName);                     // TABLE_NAME
+                                    rowVal[3] = results.getBytes("Field");
+                                    rowVal[4] = Short.toString(typeDesc.mysqlType == MysqlType.YEAR && !DatabaseMetaData.this.yearIsDateType ? Types.SMALLINT
+                                            : (short) typeDesc.mysqlType.getJdbcType()).getBytes();  // DATA_TYPE (jdbc)
+                                    rowVal[5] = s2b(typeDesc.mysqlType.getName());  // TYPE_NAME (native)
+                                    if (typeDesc.columnSize == null) {              // COLUMN_SIZE
+                                        rowVal[6] = null;
+                                    } else {
+                                        String collation = results.getString("Collation");
+                                        int mbminlen = 1;
+                                        if (collation != null) {
+                                            if (collation.indexOf("ucs2") > -1 || collation.indexOf("utf16") > -1) {
+                                                mbminlen = 2;
+                                            } else if (collation.indexOf("utf32") > -1) {
+                                                mbminlen = 4;
+                                            }
+                                        }
+                                        rowVal[6] = mbminlen == 1 ? s2b(typeDesc.columnSize.toString())
+                                                : s2b(((Integer) (typeDesc.columnSize / mbminlen)).toString());
+                                    }
+                                    rowVal[7] = s2b(Integer.toString(typeDesc.bufferLength));
+                                    rowVal[8] = typeDesc.decimalDigits == null ? null : s2b(typeDesc.decimalDigits.toString());
+                                    rowVal[9] = s2b(Integer.toString(typeDesc.numPrecRadix));
+                                    rowVal[10] = s2b(Integer.toString(typeDesc.nullability));
 
-                            results = stmt.executeQuery(queryBuf.toString());
+                                    try {
+                                        rowVal[11] = results.getBytes("Comment");   // REMARK column
+                                    } catch (Exception E) {
+                                        rowVal[11] = new byte[0];                   // REMARK column
+                                    }
 
-                            int ordPos = 1;
+                                    rowVal[12] = results.getBytes("Default");       // COLUMN_DEF
+                                    rowVal[13] = new byte[] { (byte) '0' };         // SQL_DATA_TYPE
+                                    rowVal[14] = new byte[] { (byte) '0' };         // SQL_DATE_TIME_SUB
 
-                            while (results.next()) {
-                                TypeDescriptor typeDesc = new TypeDescriptor(results.getString("Type"), results.getString("Null"));
+                                    if (StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "CHAR") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "BLOB") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "TEXT") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "ENUM") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "SET") != -1
+                                            || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "BINARY") != -1) {
+                                        rowVal[15] = rowVal[6];                     // CHAR_OCTET_LENGTH
+                                    } else {
+                                        rowVal[15] = null;
+                                    }
 
-                                byte[][] rowVal = new byte[24][];
-                                rowVal[0] = DatabaseMetaData.this.databaseTerm.getValue() == DatabaseTerm.SCHEMA ? s2b("def") : s2b(dbStr);    // TABLE_CAT
-                                rowVal[1] = DatabaseMetaData.this.databaseTerm.getValue() == DatabaseTerm.SCHEMA ? s2b(dbStr) : null;          // TABLE_SCHEM
-                                rowVal[2] = s2b(tableName);                     // TABLE_NAME
-                                rowVal[3] = results.getBytes("Field");
-                                rowVal[4] = Short.toString(typeDesc.mysqlType == MysqlType.YEAR && !DatabaseMetaData.this.yearIsDateType ? Types.SMALLINT
-                                        : (short) typeDesc.mysqlType.getJdbcType()).getBytes();  // DATA_TYPE (jdbc)
-                                rowVal[5] = s2b(typeDesc.mysqlType.getName());  // TYPE_NAME (native)
-                                if (typeDesc.columnSize == null) {              // COLUMN_SIZE
-                                    rowVal[6] = null;
-                                } else {
-                                    String collation = results.getString("Collation");
-                                    int mbminlen = 1;
-                                    if (collation != null) {
-                                        // not null collation could only be returned by server for character types, so we don't need to check type name
-                                        if (collation.indexOf("ucs2") > -1 || collation.indexOf("utf16") > -1) {
-                                            mbminlen = 2;
-                                        } else if (collation.indexOf("utf32") > -1) {
-                                            mbminlen = 4;
+                                    // ORDINAL_POSITION
+                                    if (!fixUpOrdinalsRequired) {
+                                        rowVal[16] = Integer.toString(ordPos++).getBytes();
+                                    } else {
+                                        String origColName = results.getString("Field");
+                                        Integer realOrdinal = ordinalFixUpMap.get(origColName);
+
+                                        if (realOrdinal != null) {
+                                            rowVal[16] = realOrdinal.toString().getBytes();
+                                        } else {
+                                            throw SQLError.createSQLException(Messages.getString("DatabaseMetaData.10"), MysqlErrorNumbers.SQL_STATE_GENERAL_ERROR,
+                                                    getExceptionInterceptor());
                                         }
                                     }
-                                    rowVal[6] = mbminlen == 1 ? s2b(typeDesc.columnSize.toString())
-                                            : s2b(((Integer) (typeDesc.columnSize / mbminlen)).toString());
-                                }
-                                rowVal[7] = s2b(Integer.toString(typeDesc.bufferLength));
-                                rowVal[8] = typeDesc.decimalDigits == null ? null : s2b(typeDesc.decimalDigits.toString());
-                                rowVal[9] = s2b(Integer.toString(typeDesc.numPrecRadix));
-                                rowVal[10] = s2b(Integer.toString(typeDesc.nullability));
 
-                                //
-                                // Doesn't always have this field, depending on version
-                                //
-                                try {
-                                    rowVal[11] = results.getBytes("Comment");   // REMARK column
-                                } catch (Exception E) {
-                                    rowVal[11] = new byte[0];                   // REMARK column
-                                }
+                                    rowVal[17] = s2b(typeDesc.isNullable);
 
-                                rowVal[12] = results.getBytes("Default");       // COLUMN_DEF
-                                rowVal[13] = new byte[] { (byte) '0' };         // SQL_DATA_TYPE
-                                rowVal[14] = new byte[] { (byte) '0' };         // SQL_DATE_TIME_SUB
+                                    // We don't support REF or DISTINCT types
+                                    rowVal[18] = null;
+                                    rowVal[19] = null;
+                                    rowVal[20] = null;
+                                    rowVal[21] = null;
 
-                                if (StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "CHAR") != -1
-                                        || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "BLOB") != -1
-                                        || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "TEXT") != -1
-                                        || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "ENUM") != -1
-                                        || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "SET") != -1
-                                        || StringUtils.indexOfIgnoreCase(typeDesc.mysqlType.getName(), "BINARY") != -1) {
-                                    rowVal[15] = rowVal[6];                     // CHAR_OCTET_LENGTH
-                                } else {
-                                    rowVal[15] = null;
-                                }
+                                    rowVal[22] = s2b("");
 
-                                // ORDINAL_POSITION
-                                if (!fixUpOrdinalsRequired) {
-                                    rowVal[16] = Integer.toString(ordPos++).getBytes();
-                                } else {
-                                    String origColName = results.getString("Field");
-                                    Integer realOrdinal = ordinalFixUpMap.get(origColName);
+                                    String extra = results.getString("Extra");
 
-                                    if (realOrdinal != null) {
-                                        rowVal[16] = realOrdinal.toString().getBytes();
-                                    } else {
-                                        throw SQLError.createSQLException(Messages.getString("DatabaseMetaData.10"), MysqlErrorNumbers.SQL_STATE_GENERAL_ERROR,
-                                                getExceptionInterceptor());
+                                    if (extra != null) {
+                                        rowVal[22] = s2b(StringUtils.indexOfIgnoreCase(extra, "auto_increment") != -1 ? "YES" : "NO");
+                                        rowVal[23] = s2b(StringUtils.indexOfIgnoreCase(extra, "generated") != -1 ? "YES" : "NO");
                                     }
+
+                                    rows.add(new ByteArrayRow(rowVal, getExceptionInterceptor()));
                                 }
+                            */ // end of removed standard MySQL mode
 
-                                rowVal[17] = s2b(typeDesc.isNullable);
-
-                                // We don't support REF or DISTINCT types
-                                rowVal[18] = null;
-                                rowVal[19] = null;
-                                rowVal[20] = null;
-                                rowVal[21] = null;
-
-                                rowVal[22] = s2b("");
-
-                                String extra = results.getString("Extra");
-
-                                if (extra != null) {
-                                    rowVal[22] = s2b(StringUtils.indexOfIgnoreCase(extra, "auto_increment") != -1 ? "YES" : "NO");
-                                    rowVal[23] = s2b(StringUtils.indexOfIgnoreCase(extra, "generated") != -1 ? "YES" : "NO");
-                                }
-
-                                rows.add(new ByteArrayRow(rowVal, getExceptionInterceptor()));
-                            }
                         } finally {
                             if (results != null) {
                                 try {
@@ -2316,6 +2431,235 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
         fields[22] = new Field("", "IS_AUTOINCREMENT", this.metadataCollationIndex, this.metadataEncoding, MysqlType.CHAR, 3);
         fields[23] = new Field("", "IS_GENERATEDCOLUMN", this.metadataCollationIndex, this.metadataEncoding, MysqlType.CHAR, 3);
         return fields;
+    }
+
+    /**
+     * DDB-specific helper: executes SHOW CREATE TABLE and parses column definitions from the DDL string.
+     * Returns a list of maps, one per column, with keys matching standard SHOW FULL COLUMNS column names:
+     * Field, Type, Null, Key, Default, Extra, Comment, Collation.
+     *
+     * Example DDL fragment parsed:
+     *   `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
+     *   `name` varchar(128) DEFAULT NULL COMMENT '名称',
+     *   PRIMARY KEY (`id`),
+     */
+    protected List<Map<String, String>> parseDdbColumnsFromCreateTable(Statement stmt, String tableName) throws SQLException {
+        String query = "SHOW CREATE TABLE " + StringUtils.quoteIdentifier(tableName, this.quotedId, this.pedantic);
+        ResultSet rs = stmt.executeQuery(query);
+        String ddl = null;
+        try {
+            if (rs.next()) {
+                ddl = rs.getString(2); // second column is the CREATE TABLE DDL
+            }
+        } finally {
+            rs.close();
+        }
+
+        List<Map<String, String>> columns = new ArrayList<>();
+        if (ddl == null) {
+            return columns;
+        }
+
+        // Collect primary key columns from DDL (for Key field)
+        Set<String> primaryKeys = new java.util.HashSet<>();
+        java.util.regex.Matcher pkMatcher = java.util.regex.Pattern
+                .compile("PRIMARY\\s+KEY\\s*\\(([^)]+)\\)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(ddl);
+        if (pkMatcher.find()) {
+            String pkCols = pkMatcher.group(1);
+            for (String col : pkCols.split(",")) {
+                primaryKeys.add(col.trim().replaceAll("`", ""));
+            }
+        }
+
+        // Parse each column definition line.
+        // Pattern: `colName` colType [UNSIGNED] [ZEROFILL] [CHARACTER SET x] [COLLATE x] [NOT NULL | NULL] [DEFAULT val] [AUTO_INCREMENT] [COMMENT 'xxx']
+        // We process line by line, skipping index/key/constraint lines.
+        String[] lines = ddl.split("\n");
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+            // Skip non-column lines (index definitions, table options, etc.)
+            if (!line.startsWith("`")) {
+                continue;
+            }
+
+            Map<String, String> col = new HashMap<>();
+
+            // Extract column name
+            int nameEnd = line.indexOf('`', 1);
+            if (nameEnd < 0) continue;
+            String colName = line.substring(1, nameEnd);
+            col.put("Field", colName);
+
+            // Rest of the line after column name
+            String rest = line.substring(nameEnd + 1).trim();
+            // Remove trailing comma
+            if (rest.endsWith(",")) {
+                rest = rest.substring(0, rest.length() - 1).trim();
+            }
+
+            // Extract COMMENT (must do first to avoid interfering with other parsing)
+            String comment = "";
+            java.util.regex.Matcher commentMatcher = java.util.regex.Pattern
+                    .compile("COMMENT\\s+'((?:[^'\\\\]|\\\\.)*)'", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(rest);
+            if (commentMatcher.find()) {
+                comment = commentMatcher.group(1).replace("\\'", "'");
+                rest = rest.substring(0, commentMatcher.start()).trim();
+            }
+            col.put("Comment", comment);
+
+            // Extract DEFAULT value
+            String defaultVal = null;
+            java.util.regex.Matcher defaultMatcher = java.util.regex.Pattern
+                    .compile("DEFAULT\\s+('(?:[^'\\\\]|\\\\.)*'|\\S+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(rest);
+            if (defaultMatcher.find()) {
+                defaultVal = defaultMatcher.group(1).replaceAll("^'|'$", "");
+                if (defaultVal.equalsIgnoreCase("NULL")) {
+                    defaultVal = null;
+                }
+                rest = rest.substring(0, defaultMatcher.start()).trim();
+            }
+            col.put("Default", defaultVal);
+
+            // Detect AUTO_INCREMENT
+            boolean autoIncrement = java.util.regex.Pattern
+                    .compile("\\bAUTO_INCREMENT\\b", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(rest).find();
+            // Detect ON UPDATE (for timestamp)
+            boolean onUpdateCurrentTimestamp = java.util.regex.Pattern
+                    .compile("\\bON\\s+UPDATE\\b", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(rest).find();
+            String extra = autoIncrement ? "auto_increment" : (onUpdateCurrentTimestamp ? "on update CURRENT_TIMESTAMP" : "");
+            col.put("Extra", extra);
+            col.put("IS_AUTOINCREMENT", autoIncrement ? "YES" : "NO");
+
+            // Detect NOT NULL / NULL
+            boolean notNull = java.util.regex.Pattern
+                    .compile("\\bNOT\\s+NULL\\b", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(rest).find();
+            col.put("Null", notNull ? "NO" : "YES");
+
+            // Extract COLLATE
+            String collation = null;
+            java.util.regex.Matcher collateMatcher = java.util.regex.Pattern
+                    .compile("\\bCOLLATE\\s+(\\S+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(rest);
+            if (collateMatcher.find()) {
+                collation = collateMatcher.group(1);
+            }
+            col.put("Collation", collation);
+
+            // Extract type: everything up to the first keyword boundary (after removing modifiers already handled)
+            // Strip known keywords to isolate the type token
+            String typeStr = rest
+                    .replaceAll("(?i)\\bNOT\\s+NULL\\b", "")
+                    .replaceAll("(?i)\\bNULL\\b", "")
+                    .replaceAll("(?i)\\bAUTO_INCREMENT\\b", "")
+                    .replaceAll("(?i)\\bON\\s+UPDATE\\s+\\S+", "")
+                    .replaceAll("(?i)\\bCHARACTER\\s+SET\\s+\\S+", "")
+                    .replaceAll("(?i)\\bCOLLATE\\s+\\S+", "")
+                    .replaceAll("(?i)\\bUNIQUE\\s+KEY\\b", "")
+                    .trim();
+            col.put("Type", typeStr);
+
+            // Determine Key field
+            String key = "";
+            if (primaryKeys.contains(colName)) {
+                key = "PRI";
+            } else if (java.util.regex.Pattern.compile("\\bUNIQUE\\b", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(rawLine).find()) {
+                key = "UNI";
+            }
+            col.put("Key", key);
+
+            columns.add(col);
+        }
+        return columns;
+    }
+
+    /**
+     * DDB-specific helper: parses index definitions from SHOW CREATE TABLE DDL output.
+     * Returns a list of maps representing each index entry (one map per column-in-index),
+     * with keys matching standard SHOW KEYS / SHOW INDEX column names:
+     * Table, Non_unique, Key_name, Seq_in_index, Column_name, Collation, Cardinality, Sub_part.
+     *
+     * This works for ALL logical tables in DDB (including cross-shard tables), unlike
+     * SHOW KEYS / SHOW INDEXES which fail with "Table doesn't exist" for cross-shard tables.
+     */
+    protected List<Map<String, String>> parseDdbIndexesFromCreateTable(Statement stmt, String tableName) throws SQLException {
+        String query = "SHOW CREATE TABLE " + StringUtils.quoteIdentifier(tableName, this.quotedId, this.pedantic);
+        ResultSet rs = stmt.executeQuery(query);
+        String ddl = null;
+        try {
+            if (rs.next()) {
+                ddl = rs.getString(2);
+            }
+        } finally {
+            rs.close();
+        }
+
+        List<Map<String, String>> indexes = new ArrayList<>();
+        if (ddl == null) {
+            return indexes;
+        }
+
+        // Regex patterns for index lines in CREATE TABLE DDL:
+        //   PRIMARY KEY (`col1`, `col2`)
+        //   UNIQUE KEY `idx_name` (`col1`)
+        //   KEY `idx_name` (`col1`, `col2`)
+        //   UNIQUE INDEX `idx_name` (`col1`)
+        //   INDEX `idx_name` (`col1`)
+        java.util.regex.Pattern idxPattern = java.util.regex.Pattern.compile(
+                "^\\s*(PRIMARY\\s+KEY|UNIQUE\\s+(?:KEY|INDEX)|(?:KEY|INDEX))\\s*(?:`([^`]*)`)?\\s*\\(([^)]+)\\)",
+                java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.MULTILINE);
+
+        java.util.regex.Matcher m = idxPattern.matcher(ddl);
+        while (m.find()) {
+            String indexTypeRaw = m.group(1).toUpperCase().replaceAll("\\s+", " "); // e.g. "PRIMARY KEY", "UNIQUE KEY", "KEY"
+            String indexName    = m.group(2); // null for PRIMARY KEY
+            String colListStr   = m.group(3);
+
+            boolean isPrimary = indexTypeRaw.startsWith("PRIMARY");
+            boolean isUnique  = isPrimary || indexTypeRaw.startsWith("UNIQUE");
+
+            if (isPrimary) {
+                indexName = "PRIMARY";
+            } else if (indexName == null || indexName.isEmpty()) {
+                // Anonymous index — use first column name as index name (MySQL convention)
+                String firstCol = colListStr.split(",")[0].trim().replaceAll("`", "").replaceAll("\\(.*", "").trim();
+                indexName = firstCol;
+            }
+
+            // Parse column list: `col1`(prefixLen), `col2`, ...
+            String[] colTokens = colListStr.split(",");
+            int seqInIndex = 1;
+            for (String colToken : colTokens) {
+                colToken = colToken.trim();
+                // Extract column name and optional prefix length
+                java.util.regex.Matcher colMatcher = java.util.regex.Pattern
+                        .compile("`([^`]+)`(?:\\((\\d+)\\))?")
+                        .matcher(colToken);
+                String colName  = colToken.replaceAll("`", "").replaceAll("\\(.*", "").trim();
+                String subPart  = null;
+                if (colMatcher.find()) {
+                    colName = colMatcher.group(1);
+                    subPart = colMatcher.group(2); // may be null
+                }
+
+                Map<String, String> row = new HashMap<>();
+                row.put("Table",        tableName);
+                row.put("Non_unique",   isUnique ? "0" : "1");
+                row.put("Key_name",     indexName);
+                row.put("Seq_in_index", String.valueOf(seqInIndex++));
+                row.put("Column_name",  colName);
+                row.put("Collation",    "A");   // MySQL default: ascending
+                row.put("Cardinality",  "0");   // Unknown without stats
+                row.put("Sub_part",     subPart);
+                indexes.add(row);
+            }
+        }
+        return indexes;
     }
 
     @Override
@@ -2741,58 +3085,96 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
                     ResultSet results = null;
 
                     try {
-                        StringBuilder queryBuf = new StringBuilder("SHOW INDEX FROM ");
-                        queryBuf.append(StringUtils.quoteIdentifier(table, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-                        queryBuf.append(" FROM ");
-                        queryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-
-                        try {
-                            results = stmt.executeQuery(queryBuf.toString());
-                        } catch (SQLException sqlEx) {
-                            String sqlState = sqlEx.getSQLState(); // If SQLState is 42S02, ignore this SQLException it means the table doesn't exist....
-                            int errorCode = sqlEx.getErrorCode(); // Sometimes SQLState is not mapped correctly for pre-4.1 so use error code instead.
-
-                            if (!"42S02".equals(sqlState) && errorCode != MysqlErrorNumbers.ER_NO_SUCH_TABLE
-                                    && errorCode != MysqlErrorNumbers.ER_BAD_DB_ERROR) {
-                                throw sqlEx;
-                            }
-                        }
-
-                        while (results != null && results.next()) {
-                            byte[][] row = new byte[14][];
-                            row[0] = dbMapsToSchema ? s2b("def") : s2b(dbStr);      // TABLE_CAT
-                            row[1] = dbMapsToSchema ? s2b(dbStr) : null;            // TABLE_SCHEM
-                            row[2] = results.getBytes("Table");                     // TABLE_NAME
-
-                            boolean indexIsUnique = results.getInt("Non_unique") == 0;
-
-                            row[3] = !indexIsUnique ? s2b("true") : s2b("false");   // NON_UNIQUE
-                            row[4] = null;                                          // INDEX_QUALIFIER
-                            row[5] = results.getBytes("Key_name");                  // INDEX_NAME
+                        {
+                            // [DDB] SHOW INDEX/INDEXES/KEYS fails for cross-shard tables.
+                            // Parse index info from SHOW CREATE TABLE DDL instead.
+                            List<Map<String, String>> ddbIndexes = parseDdbIndexesFromCreateTable(stmt, table);
                             short indexType = java.sql.DatabaseMetaData.tableIndexOther;
-                            row[6] = Integer.toString(indexType).getBytes();        // TYPE
-                            row[7] = results.getBytes("Seq_in_index");              // ORDINAL_POSITION
-                            row[8] = results.getBytes("Column_name");               // COLUMN_NAME
-                            row[9] = results.getBytes("Collation");                 // ASC_OR_DESC
 
-                            long cardinality = results.getLong("Cardinality");
+                            for (Map<String, String> idx : ddbIndexes) {
+                                boolean indexIsUnique = "0".equals(idx.get("Non_unique"));
 
-                            row[10] = s2b(String.valueOf(cardinality));             // CARDINALITY
-                            row[11] = s2b("0");                                     // PAGES
-                            row[12] = null;                                         // FILTER_CONDITION
-
-                            IndexMetaDataKey indexInfoKey = new IndexMetaDataKey(!indexIsUnique, indexType, results.getString("Key_name").toLowerCase(),
-                                    results.getShort("Seq_in_index"));
-
-                            if (unique) {
-                                if (indexIsUnique) {
-                                    sortedRows.put(indexInfoKey, new ByteArrayRow(row, getExceptionInterceptor()));
+                                if (unique && !indexIsUnique) {
+                                    continue; // caller wants unique indexes only
                                 }
-                            } else {
-                                // All rows match
+
+                                byte[][] row = new byte[14][];
+                                row[0] = dbMapsToSchema ? s2b("def") : s2b(dbStr);      // TABLE_CAT
+                                row[1] = dbMapsToSchema ? s2b(dbStr) : null;            // TABLE_SCHEM
+                                row[2] = s2b(idx.get("Table"));                         // TABLE_NAME
+                                row[3] = !indexIsUnique ? s2b("true") : s2b("false");   // NON_UNIQUE
+                                row[4] = null;                                           // INDEX_QUALIFIER
+                                row[5] = s2b(idx.get("Key_name"));                      // INDEX_NAME
+                                row[6] = Integer.toString(indexType).getBytes();         // TYPE
+                                row[7] = s2b(idx.get("Seq_in_index"));                  // ORDINAL_POSITION
+                                row[8] = s2b(idx.get("Column_name"));                   // COLUMN_NAME
+                                row[9] = s2b(idx.get("Collation"));                     // ASC_OR_DESC
+                                row[10] = s2b(idx.get("Cardinality"));                  // CARDINALITY
+                                row[11] = s2b("0");                                      // PAGES
+                                row[12] = null;                                          // FILTER_CONDITION
+
+                                IndexMetaDataKey indexInfoKey = new IndexMetaDataKey(
+                                        !indexIsUnique, indexType,
+                                        idx.get("Key_name").toLowerCase(),
+                                        Short.parseShort(idx.get("Seq_in_index")));
                                 sortedRows.put(indexInfoKey, new ByteArrayRow(row, getExceptionInterceptor()));
                             }
-                        }
+
+                        } /* else removed: DDB only
+                            // Standard MySQL mode: SHOW INDEXES FROM
+                            StringBuilder queryBuf = new StringBuilder("SHOW INDEXES FROM ");
+                            queryBuf.append(StringUtils.quoteIdentifier(table, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                            queryBuf.append(" FROM ");
+                            queryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+
+                            try {
+                                results = stmt.executeQuery(queryBuf.toString());
+                            } catch (SQLException sqlEx) {
+                                String sqlState = sqlEx.getSQLState();
+                                int errorCode = sqlEx.getErrorCode();
+                                if (!"42S02".equals(sqlState) && errorCode != MysqlErrorNumbers.ER_NO_SUCH_TABLE
+                                        && errorCode != MysqlErrorNumbers.ER_BAD_DB_ERROR) {
+                                    throw sqlEx;
+                                }
+                            }
+
+                            while (results != null && results.next()) {
+                                byte[][] row = new byte[14][];
+                                row[0] = dbMapsToSchema ? s2b("def") : s2b(dbStr);      // TABLE_CAT
+                                row[1] = dbMapsToSchema ? s2b(dbStr) : null;            // TABLE_SCHEM
+                                row[2] = results.getBytes("Table");                     // TABLE_NAME
+
+                                boolean indexIsUnique = results.getInt("Non_unique") == 0;
+
+                                row[3] = !indexIsUnique ? s2b("true") : s2b("false");   // NON_UNIQUE
+                                row[4] = null;                                           // INDEX_QUALIFIER
+                                row[5] = results.getBytes("Key_name");                  // INDEX_NAME
+                                short indexType = java.sql.DatabaseMetaData.tableIndexOther;
+                                row[6] = Integer.toString(indexType).getBytes();         // TYPE
+                                row[7] = results.getBytes("Seq_in_index");               // ORDINAL_POSITION
+                                row[8] = results.getBytes("Column_name");                // COLUMN_NAME
+                                row[9] = results.getBytes("Collation");                  // ASC_OR_DESC
+
+                                long cardinality = results.getLong("Cardinality");
+
+                                row[10] = s2b(String.valueOf(cardinality));              // CARDINALITY
+                                row[11] = s2b("0");                                      // PAGES
+                                row[12] = null;                                          // FILTER_CONDITION
+
+                                IndexMetaDataKey indexInfoKey = new IndexMetaDataKey(!indexIsUnique, indexType,
+                                        results.getString("Key_name").toLowerCase(),
+                                        results.getShort("Seq_in_index"));
+
+                                if (unique) {
+                                    if (indexIsUnique) {
+                                        sortedRows.put(indexInfoKey, new ByteArrayRow(row, getExceptionInterceptor()));
+                                    }
+                                } else {
+                                    sortedRows.put(indexInfoKey, new ByteArrayRow(row, getExceptionInterceptor()));
+                                }
+                            }
+                        */ // end of removed standard MySQL mode
+
                     } finally {
                         if (results != null) {
                             try {
@@ -2989,46 +3371,64 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
                     ResultSet rs = null;
 
                     try {
-                        StringBuilder queryBuf = new StringBuilder("SHOW KEYS FROM ");
-                        queryBuf.append(StringUtils.quoteIdentifier(table, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-                        queryBuf.append(" FROM ");
-                        queryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-
-                        try {
-                            rs = stmt.executeQuery(queryBuf.toString());
-                        } catch (SQLException sqlEx) {
-                            String sqlState = sqlEx.getSQLState(); // If SQLState is 42S02, ignore this SQLException it means the table doesn't exist....
-                            int errorCode = sqlEx.getErrorCode(); // Sometimes SQLState is not mapped correctly for pre-4.1 so use error code instead.
-
-                            if (!"42S02".equals(sqlState) && errorCode != MysqlErrorNumbers.ER_NO_SUCH_TABLE
-                                    && errorCode != MysqlErrorNumbers.ER_BAD_DB_ERROR) {
-                                throw sqlEx;
-                            }
-                        }
-
                         TreeMap<String, byte[][]> sortMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-                        while (rs != null && rs.next()) {
-                            String keyType = rs.getString("Key_name");
 
-                            if (keyType != null) {
-                                if (keyType.equalsIgnoreCase("PRIMARY") || keyType.equalsIgnoreCase("PRI")) {
+                        {
+                            // [DDB] SHOW KEYS FROM fails for cross-shard tables.
+                            // Parse PRIMARY KEY from SHOW CREATE TABLE DDL instead.
+                            List<Map<String, String>> ddbIndexes = parseDdbIndexesFromCreateTable(stmt, table);
+                            for (Map<String, String> idx : ddbIndexes) {
+                                if ("PRIMARY".equalsIgnoreCase(idx.get("Key_name"))) {
                                     byte[][] tuple = new byte[6][];
-                                    tuple[0] = dbMapsToSchema ? s2b("def") : s2b(dbStr);// TABLE_CAT
-                                    tuple[1] = dbMapsToSchema ? s2b(dbStr) : null;      // TABLE_SCHEM
-                                    tuple[2] = s2b(table);                              // TABLE_NAME
-
-                                    String columnName = rs.getString("Column_name");
-                                    tuple[3] = s2b(columnName);                         // COLUMN_NAME
-                                    tuple[4] = s2b(rs.getString("Seq_in_index"));       // KEY_SEQ
-                                    tuple[5] = s2b(keyType);                            // PK_NAME
+                                    tuple[0] = dbMapsToSchema ? s2b("def") : s2b(dbStr); // TABLE_CAT
+                                    tuple[1] = dbMapsToSchema ? s2b(dbStr) : null;       // TABLE_SCHEM
+                                    tuple[2] = s2b(table);                                // TABLE_NAME
+                                    String columnName = idx.get("Column_name");
+                                    tuple[3] = s2b(columnName);                           // COLUMN_NAME
+                                    tuple[4] = s2b(idx.get("Seq_in_index"));              // KEY_SEQ
+                                    tuple[5] = s2b("PRIMARY");                            // PK_NAME
                                     sortMap.put(columnName, tuple);
                                 }
                             }
-                        }
 
-                        // Now pull out in column name sorted order
+                        } /* else removed: DDB only
+                            // Standard MySQL mode: SHOW KEYS FROM
+                            StringBuilder queryBuf = new StringBuilder("SHOW KEYS FROM ");
+                            queryBuf.append(StringUtils.quoteIdentifier(table, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                            queryBuf.append(" FROM ");
+                            queryBuf.append(StringUtils.quoteIdentifier(dbStr, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+
+                            try {
+                                rs = stmt.executeQuery(queryBuf.toString());
+                            } catch (SQLException sqlEx) {
+                                String sqlState = sqlEx.getSQLState();
+                                int errorCode = sqlEx.getErrorCode();
+                                if (!"42S02".equals(sqlState) && errorCode != MysqlErrorNumbers.ER_NO_SUCH_TABLE
+                                        && errorCode != MysqlErrorNumbers.ER_BAD_DB_ERROR) {
+                                    throw sqlEx;
+                                }
+                            }
+
+                            while (rs != null && rs.next()) {
+                                String keyType = rs.getString("Key_name");
+                                if (keyType != null) {
+                                    if (keyType.equalsIgnoreCase("PRIMARY") || keyType.equalsIgnoreCase("PRI")) {
+                                        byte[][] tuple = new byte[6][];
+                                        tuple[0] = dbMapsToSchema ? s2b("def") : s2b(dbStr); // TABLE_CAT
+                                        tuple[1] = dbMapsToSchema ? s2b(dbStr) : null;       // TABLE_SCHEM
+                                        tuple[2] = s2b(table);                                // TABLE_NAME
+                                        String columnName = rs.getString("Column_name");
+                                        tuple[3] = s2b(columnName);                           // COLUMN_NAME
+                                        tuple[4] = s2b(rs.getString("Seq_in_index"));         // KEY_SEQ
+                                        tuple[5] = s2b(keyType);                              // PK_NAME
+                                        sortMap.put(columnName, tuple);
+                                    }
+                                }
+                            }
+                        */ // end of removed standard MySQL mode
+
+                        // Pull out in column name sorted order
                         Iterator<byte[][]> sortedIterator = sortMap.values().iterator();
-
                         while (sortedIterator.hasNext()) {
                             rows.add(new ByteArrayRow(sortedIterator.next(), getExceptionInterceptor()));
                         }
@@ -3722,14 +4122,10 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
                     try {
 
                         try {
-                            StringBuilder sqlBuf = new StringBuilder("SHOW FULL TABLES FROM ");
-                            sqlBuf.append(StringUtils.quoteIdentifier(dbPattern, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
-                            if (tableNamePat != null) {
-                                sqlBuf.append(" LIKE ");
-                                sqlBuf.append(StringUtils.quoteIdentifier(tableNamePat, "'", true));
-                            }
-
-                            results = stmt.executeQuery(sqlBuf.toString());
+                            // DDB does not support `SHOW FULL TABLES` (it penetrates to physical shards),
+                            // `SHOW TABLES LIKE '...'` or `SHOW TABLES FROM <db>`. Use plain `SHOW TABLES`
+                            // and detect DDB by checking the first column name of the result set.
+                            results = stmt.executeQuery("SHOW TABLES");
                         } catch (SQLException sqlEx) {
                             if (MysqlErrorNumbers.SQL_STATE_COMMUNICATION_LINK_FAILURE.equals(sqlEx.getSQLState())) {
                                 throw sqlEx;
@@ -3738,140 +4134,221 @@ public class DatabaseMetaData implements java.sql.DatabaseMetaData {
                             return;
                         }
 
-                        boolean shouldReportTables = false;
-                        boolean shouldReportViews = false;
-                        boolean shouldReportSystemTables = false;
-                        boolean shouldReportSystemViews = false;
-                        boolean shouldReportLocalTemporaries = false;
+                        // Detect DDB environment: DDB returns "NAME" as the first column of SHOW TABLES.
+                        // [DDB] SHOW TABLES returns 11 columns:
+                        // SCHEMA_NAME | TYPE | POLICY | MODEL | BF | PKEY | BUCKETNO | WRITEABLE | NEED_CHECK_DUP_KEY | COMMENT | ID_ASSIGN_TYPE
+                        // TYPE values: INNODB (regular table). No VIEW support in DDB.
+                        // tableNamePattern filtering must be done on the client side (Java).
+                        {
 
-                        if (types == null || types.length == 0) {
-                            shouldReportTables = true;
-                            shouldReportViews = true;
-                            shouldReportSystemTables = true;
-                            shouldReportSystemViews = true;
-                            shouldReportLocalTemporaries = true;
-                        } else {
-                            for (int i = 0; i < types.length; i++) {
-                                if (TableType.TABLE.equalsTo(types[i])) {
-                                    shouldReportTables = true;
-
-                                } else if (TableType.VIEW.equalsTo(types[i])) {
-                                    shouldReportViews = true;
-
-                                } else if (TableType.SYSTEM_TABLE.equalsTo(types[i])) {
-                                    shouldReportSystemTables = true;
-
-                                } else if (TableType.SYSTEM_VIEW.equalsTo(types[i])) {
-                                    shouldReportSystemViews = true;
-
-                                } else if (TableType.LOCAL_TEMPORARY.equalsTo(types[i])) {
-                                    shouldReportLocalTemporaries = true;
+                            boolean shouldReportTables = (types == null || types.length == 0);
+                            if (!shouldReportTables && types != null) {
+                                for (String t : types) {
+                                    if (TableType.TABLE.equalsTo(t)) {
+                                        shouldReportTables = true;
+                                        break;
+                                    }
                                 }
                             }
-                        }
 
-                        int typeColumnIndex = 0;
-                        boolean hasTableTypes = false;
-
-                        try {
-                            // Both column names have been in use in the source tree so far....
-                            typeColumnIndex = results.findColumn("table_type");
-                            hasTableTypes = true;
-                        } catch (SQLException sqlEx) {
-
-                            // We should probably check SQLState here, but that can change depending on the server version and user properties, however,
-                            // we'll get a 'true' SQLException when we actually try to find the 'Type' column
-                            //
-                            try {
-                                typeColumnIndex = results.findColumn("Type");
-                                hasTableTypes = true;
-                            } catch (SQLException sqlEx2) {
-                                hasTableTypes = false;
+                            // Build a pattern matcher for tableNamePattern (supports SQL wildcards % and _)
+                            java.util.regex.Pattern tableNameRegex = null;
+                            if (tableNamePat != null && !tableNamePat.equals("%")) {
+                                // Convert SQL LIKE pattern to Java regex
+                                String regex = tableNamePat
+                                        .replace("\\", "\\\\")
+                                        .replace(".", "\\.")
+                                        .replace("$", "\\$")
+                                        .replace("^", "\\^")
+                                        .replace("(", "\\(")
+                                        .replace(")", "\\)")
+                                        .replace("[", "\\[")
+                                        .replace("]", "\\]")
+                                        .replace("{", "\\{")
+                                        .replace("}", "\\}")
+                                        .replace("+", "\\+")
+                                        .replace("?", "\\?")
+                                        .replace("|", "\\|")
+                                        .replace("*", "\\*")
+                                        .replace("%", ".*")     // SQL % → regex .*
+                                        .replace("_", ".");     // SQL _ → regex .
+                                tableNameRegex = java.util.regex.Pattern.compile(regex, java.util.regex.Pattern.CASE_INSENSITIVE);
                             }
-                        }
 
-                        while (results.next()) {
-                            byte[][] row = new byte[10][];
-                            row[0] = dbMapsToSchema ? s2b("def") : s2b(dbPattern);// TABLE_CAT
-                            row[1] = dbMapsToSchema ? s2b(dbPattern) : null;      // TABLE_SCHEM
-                            row[2] = results.getBytes(1);
-                            row[4] = new byte[0];
-                            row[5] = null;
-                            row[6] = null;
-                            row[7] = null;
-                            row[8] = null;
-                            row[9] = null;
+                            while (results.next()) {
+                                String tableName = results.getString(1); // NAME column
+                                String ddbType = results.getString(2);   // TYPE column (e.g. INNODB)
+                                String comment = results.getString(10);  // COMMENT column
 
-                            if (hasTableTypes) {
-                                String tableType = results.getString(typeColumnIndex);
-
-                                switch (TableType.getTableTypeCompliantWith(tableType)) {
-                                    case TABLE:
-                                        boolean reportTable = false;
-                                        TableMetaDataKey tablesKey = null;
-
-                                        if (operatingOnSystemDB && shouldReportSystemTables) {
-                                            row[3] = TableType.SYSTEM_TABLE.asBytes();
-                                            tablesKey = new TableMetaDataKey(TableType.SYSTEM_TABLE.getName(), dbPattern, null, results.getString(1));
-                                            reportTable = true;
-
-                                        } else if (!operatingOnSystemDB && shouldReportTables) {
-                                            row[3] = TableType.TABLE.asBytes();
-                                            tablesKey = new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, results.getString(1));
-                                            reportTable = true;
-                                        }
-
-                                        if (reportTable) {
-                                            sortedRows.put(tablesKey, new ByteArrayRow(row, getExceptionInterceptor()));
-                                        }
-                                        break;
-
-                                    case VIEW:
-                                        if (shouldReportViews) {
-                                            row[3] = TableType.VIEW.asBytes();
-                                            sortedRows.put(new TableMetaDataKey(TableType.VIEW.getName(), dbPattern, null, results.getString(1)),
-                                                    new ByteArrayRow(row, getExceptionInterceptor()));
-                                        }
-                                        break;
-
-                                    case SYSTEM_TABLE:
-                                        if (shouldReportSystemTables) {
-                                            row[3] = TableType.SYSTEM_TABLE.asBytes();
-                                            sortedRows.put(new TableMetaDataKey(TableType.SYSTEM_TABLE.getName(), dbPattern, null, results.getString(1)),
-                                                    new ByteArrayRow(row, getExceptionInterceptor()));
-                                        }
-                                        break;
-
-                                    case SYSTEM_VIEW:
-                                        if (shouldReportSystemViews) {
-                                            row[3] = TableType.SYSTEM_VIEW.asBytes();
-                                            sortedRows.put(new TableMetaDataKey(TableType.SYSTEM_VIEW.getName(), dbPattern, null, results.getString(1)),
-                                                    new ByteArrayRow(row, getExceptionInterceptor()));
-                                        }
-                                        break;
-
-                                    case LOCAL_TEMPORARY:
-                                        if (shouldReportLocalTemporaries) {
-                                            row[3] = TableType.LOCAL_TEMPORARY.asBytes();
-                                            sortedRows.put(new TableMetaDataKey(TableType.LOCAL_TEMPORARY.getName(), dbPattern, null, results.getString(1)),
-                                                    new ByteArrayRow(row, getExceptionInterceptor()));
-                                        }
-                                        break;
-
-                                    default:
-                                        row[3] = TableType.TABLE.asBytes();
-                                        sortedRows.put(new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, results.getString(1)),
-                                                new ByteArrayRow(row, getExceptionInterceptor()));
-                                        break;
+                                // Apply tableNamePattern filter on the client side
+                                if (tableNameRegex != null && !tableNameRegex.matcher(tableName).matches()) {
+                                    continue;
                                 }
-                            } else // TODO: Check if this branch is needed for 5.7 server (maybe refactor hasTableTypes)
-                            if (shouldReportTables) {
-                                // Pre-MySQL-5.0.1, tables only
-                                row[3] = TableType.TABLE.asBytes();
-                                sortedRows.put(new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, results.getString(1)),
+
+                                if (!shouldReportTables) {
+                                    continue;
+                                }
+
+                                byte[][] row = new byte[10][];
+                                row[0] = dbMapsToSchema ? s2b("def") : s2b(dbPattern); // TABLE_CAT
+                                row[1] = dbMapsToSchema ? s2b(dbPattern) : null;       // TABLE_SCHEM
+                                row[2] = s2b(tableName);                                // TABLE_NAME
+                                row[3] = TableType.TABLE.asBytes();                     // TABLE_TYPE (DDB only has regular tables)
+                                row[4] = comment != null ? s2b(comment) : new byte[0]; // REMARKS
+                                row[5] = null;
+                                row[6] = null;
+                                row[7] = null;
+                                row[8] = null;
+                                row[9] = null;
+
+                                sortedRows.put(new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, tableName),
                                         new ByteArrayRow(row, getExceptionInterceptor()));
                             }
-                        }
+
+                        } /* else removed: DDB only
+                            // Standard MySQL mode: re-execute with SHOW FULL TABLES for table_type info.
+                            results.close();
+                            results = null;
+
+                            try {
+                                StringBuilder sqlBuf = new StringBuilder("SHOW FULL TABLES FROM ");
+                                sqlBuf.append(StringUtils.quoteIdentifier(dbPattern, DatabaseMetaData.this.quotedId, DatabaseMetaData.this.pedantic));
+                                if (tableNamePat != null) {
+                                    sqlBuf.append(" LIKE ");
+                                    sqlBuf.append(StringUtils.quoteIdentifier(tableNamePat, "'", true));
+                                }
+                                results = stmt.executeQuery(sqlBuf.toString());
+                            } catch (SQLException sqlEx) {
+                                if (MysqlErrorNumbers.SQL_STATE_COMMUNICATION_LINK_FAILURE.equals(sqlEx.getSQLState())) {
+                                    throw sqlEx;
+                                }
+                                return;
+                            }
+
+                            boolean shouldReportTables = false;
+                            boolean shouldReportViews = false;
+                            boolean shouldReportSystemTables = false;
+                            boolean shouldReportSystemViews = false;
+                            boolean shouldReportLocalTemporaries = false;
+
+                            if (types == null || types.length == 0) {
+                                shouldReportTables = true;
+                                shouldReportViews = true;
+                                shouldReportSystemTables = true;
+                                shouldReportSystemViews = true;
+                                shouldReportLocalTemporaries = true;
+                            } else {
+                                for (int i = 0; i < types.length; i++) {
+                                    if (TableType.TABLE.equalsTo(types[i])) {
+                                        shouldReportTables = true;
+                                    } else if (TableType.VIEW.equalsTo(types[i])) {
+                                        shouldReportViews = true;
+                                    } else if (TableType.SYSTEM_TABLE.equalsTo(types[i])) {
+                                        shouldReportSystemTables = true;
+                                    } else if (TableType.SYSTEM_VIEW.equalsTo(types[i])) {
+                                        shouldReportSystemViews = true;
+                                    } else if (TableType.LOCAL_TEMPORARY.equalsTo(types[i])) {
+                                        shouldReportLocalTemporaries = true;
+                                    }
+                                }
+                            }
+
+                            int typeColumnIndex = 0;
+                            boolean hasTableTypes = false;
+
+                            try {
+                                typeColumnIndex = results.findColumn("table_type");
+                                hasTableTypes = true;
+                            } catch (SQLException sqlEx) {
+                                try {
+                                    typeColumnIndex = results.findColumn("Type");
+                                    hasTableTypes = true;
+                                } catch (SQLException sqlEx2) {
+                                    hasTableTypes = false;
+                                }
+                            }
+
+                            while (results.next()) {
+                                byte[][] row = new byte[10][];
+                                row[0] = dbMapsToSchema ? s2b("def") : s2b(dbPattern);
+                                row[1] = dbMapsToSchema ? s2b(dbPattern) : null;
+                                row[2] = results.getBytes(1);
+                                row[4] = new byte[0];
+                                row[5] = null;
+                                row[6] = null;
+                                row[7] = null;
+                                row[8] = null;
+                                row[9] = null;
+
+                                if (hasTableTypes) {
+                                    String tableType = results.getString(typeColumnIndex);
+
+                                    switch (TableType.getTableTypeCompliantWith(tableType)) {
+                                        case TABLE:
+                                            boolean reportTable = false;
+                                            TableMetaDataKey tablesKey = null;
+
+                                            if (operatingOnSystemDB && shouldReportSystemTables) {
+                                                row[3] = TableType.SYSTEM_TABLE.asBytes();
+                                                tablesKey = new TableMetaDataKey(TableType.SYSTEM_TABLE.getName(), dbPattern, null, results.getString(1));
+                                                reportTable = true;
+                                            } else if (!operatingOnSystemDB && shouldReportTables) {
+                                                row[3] = TableType.TABLE.asBytes();
+                                                tablesKey = new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, results.getString(1));
+                                                reportTable = true;
+                                            }
+
+                                            if (reportTable) {
+                                                sortedRows.put(tablesKey, new ByteArrayRow(row, getExceptionInterceptor()));
+                                            }
+                                            break;
+
+                                        case VIEW:
+                                            if (shouldReportViews) {
+                                                row[3] = TableType.VIEW.asBytes();
+                                                sortedRows.put(new TableMetaDataKey(TableType.VIEW.getName(), dbPattern, null, results.getString(1)),
+                                                        new ByteArrayRow(row, getExceptionInterceptor()));
+                                            }
+                                            break;
+
+                                        case SYSTEM_TABLE:
+                                            if (shouldReportSystemTables) {
+                                                row[3] = TableType.SYSTEM_TABLE.asBytes();
+                                                sortedRows.put(new TableMetaDataKey(TableType.SYSTEM_TABLE.getName(), dbPattern, null, results.getString(1)),
+                                                        new ByteArrayRow(row, getExceptionInterceptor()));
+                                            }
+                                            break;
+
+                                        case SYSTEM_VIEW:
+                                            if (shouldReportSystemViews) {
+                                                row[3] = TableType.SYSTEM_VIEW.asBytes();
+                                                sortedRows.put(new TableMetaDataKey(TableType.SYSTEM_VIEW.getName(), dbPattern, null, results.getString(1)),
+                                                        new ByteArrayRow(row, getExceptionInterceptor()));
+                                            }
+                                            break;
+
+                                        case LOCAL_TEMPORARY:
+                                            if (shouldReportLocalTemporaries) {
+                                                row[3] = TableType.LOCAL_TEMPORARY.asBytes();
+                                                sortedRows.put(new TableMetaDataKey(TableType.LOCAL_TEMPORARY.getName(), dbPattern, null, results.getString(1)),
+                                                        new ByteArrayRow(row, getExceptionInterceptor()));
+                                            }
+                                            break;
+
+                                        default:
+                                            row[3] = TableType.TABLE.asBytes();
+                                            sortedRows.put(new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, results.getString(1)),
+                                                    new ByteArrayRow(row, getExceptionInterceptor()));
+                                            break;
+                                    }
+                                } else if (shouldReportTables) {
+                                    // Pre-MySQL-5.0.1, tables only
+                                    row[3] = TableType.TABLE.asBytes();
+                                    sortedRows.put(new TableMetaDataKey(TableType.TABLE.getName(), dbPattern, null, results.getString(1)),
+                                            new ByteArrayRow(row, getExceptionInterceptor()));
+                                }
+                            }
+                        */ // end of removed standard MySQL mode
 
                     } finally {
                         if (results != null) {

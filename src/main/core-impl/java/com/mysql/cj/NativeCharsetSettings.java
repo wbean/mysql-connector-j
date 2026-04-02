@@ -533,7 +533,8 @@ public class NativeCharsetSettings extends CharsetMapping implements CharsetSett
             }
         }
 
-        if (customCollationIndexToCharsetName == null && this.session.getPropertySet().getBooleanProperty(PropertyKey.detectCustomCollations).getValue()) {
+        // [DDB] DDB does not have INFORMATION_SCHEMA; skip custom collation detection entirely.
+        if (false && customCollationIndexToCharsetName == null && this.session.getPropertySet().getBooleanProperty(PropertyKey.detectCustomCollations).getValue()) {
             TelemetrySpan span = this.session.getTelemetryHandler().startSpan(TelemetrySpanName.LOAD_COLLATIONS);
             try (TelemetryScope scope = span.makeCurrent()) {
                 span.setAttribute(TelemetryAttribute.DB_NAME, this.session.getHostInfo().getDatabase());
